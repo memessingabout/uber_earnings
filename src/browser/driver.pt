@@ -1,0 +1,144 @@
+from playwright.sync_api import sync_playwright, Page, BrowserContext, TimeoutError
+import time
+from typing import Optional, Callable
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from ..utils.config import config
+from ..utils.logger import logger
+from ..utils.monitoring import track_execution_time
+from .stealth import apply_stealth
+
+class BrowserManager:
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+        self.screenshot_dir = Path('debug_screenshots')
+        self.screenshot_dir.mkdir(exist_ok=True)
+    
+    def __enter__(self):
+        self.start()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+    
+    @track_execution_time
+    def start(self):
+        """Start browser with configured settings"""
+        self.playwright = sync_playwright().start()
+        
+        browser_config = config.browser
+        
+        self.browser = self.playwright.chromium.launch(
+            headless=browser_config.headless,
+            slow_mo=browser_config.slow_mo,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=VizDisplayCompositor',
+                '--no-first-run',
+                '--disable-default-apps',
+                '--disable-extensions',
+                '--disable-web-security',
+                '--disable-features=site-per-process'
+            ]
+        )
+        
+        self.context = self.browser.new_context(
+            viewport={'width': 1280, 'height': 720},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            ignore_https_errors=True
+        )
+        
+        apply_stealth(self.context)
+        
+        self.page = self.context.new_page()
+        self.page.set_default_timeout(browser_config.timeout)
+        
+        logger.info("Browser started successfully")
+    
+    def close(self):
+        """Close browser and cleanup"""
+        if self.browser:
+            self.browser.close()
+        if self.playwright:
+            self.playwright.stop()
+        logger.info("Browser closed")
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    @track_execution_time
+    def navigate_to_activities(self) -> bool:
+        """Navigate to earnings activities page"""
+        try:
+            base_url = config.scraping.base_url
+            activities_path = config.scraping.activities_path
+            url = f"{base_url}{activities_path}"
+            
+            self.page.goto(url, wait_until='networkidle')
+            self.page.wait_for_selector('[data-baseweb="card"]', timeout=10000)
+            
+            logger.info("Successfully navigated to activities page")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to navigate to activities: {e}")
+            self.take_screenshot('navigation_failed')
+            raise
+    
+    @track_execution_time
+    def wait_for_authentication(self, timeout: int = 120) -> bool:
+        """Wait for user to complete authentication if needed"""
+        try:
+            # Check if we're on login page
+            if any(term in self.page.url.lower() for term in ['login', 'signin', 'auth']):
+                logger.info("Authentication required - please log in manually")
+                print("Please complete authentication in the browser window...")
+                
+                start_time = time.time()
+                while time.time() - start_time < timeout:
+                    if any(term in self.page.url.lower() for term in ['earnings', 'activities', 'dashboard']):
+                        logger.info("Authentication successful")
+                        return True
+                    time.sleep(2)
+                
+                logger.error("Authentication timeout")
+                return False
+            
+            logger.info("Already authenticated")
+            return True
+        except Exception as e:
+            logger.error(f"Error during authentication wait: {e}")
+            return False
+    
+    @track_execution_time
+    def take_screenshot(self, name: str):
+        """Take screenshot for debugging"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = self.screenshot_dir / f"{name}_{timestamp}.png"
+        self.page.screenshot(path=filename)
+        logger.info(f"Screenshot saved: {filename}")
+    
+    @track_execution_time
+    def safe_click(self, selector: str, timeout: int = None) -> bool:
+        """Safely click element with error handling and screenshot on failure"""
+        try:
+            timeout = timeout or config.browser.timeout
+            self.page.click(selector, timeout=timeout)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to click {selector}: {e}")
+            self.take_screenshot(f"click_failed_{selector.replace('[', '').replace(']', '')}")
+            return False
+    
+    @track_execution_time
+    def wait_for_element(self, selector: str, timeout: int = None) -> bool:
+        """Wait for element to appear"""
+        try:
+            timeout = timeout or config.browser.timeout
+            self.page.wait_for_selector(selector, timeout=timeout)
+            return True
+        except TimeoutError:
+            logger.warning(f"Element {selector} not found within timeout")
+            return False
