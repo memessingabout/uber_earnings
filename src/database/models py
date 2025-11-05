@@ -1,0 +1,118 @@
+from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, Boolean, Text, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import event
+from datetime import datetime
+from pathlib import Path
+import json
+from ..utils.config import config
+from ..utils.logger import logger
+from .encryption import encryptor
+
+Base = declarative_base()
+
+class EncryptedString(TypeDecorator):
+    """Custom type for encrypted string fields"""
+    impl = Text
+    
+    def process_bind_param(self, value, dialect):
+        if value is not None and config.database.encrypt_database:
+            return encryptor.encrypt_field(value)
+        return value
+    
+    def process_result_value(self, value, dialect):
+        if value is not None and config.database.encrypt_database:
+            return encryptor.decrypt_field(value)
+        return value
+
+class Trip(Base):
+    __tablename__ = 'trips'
+    
+    trip_id = Column(String(50), primary_key=True)
+    trip_type = Column(String(20))
+    date = Column(DateTime)
+    duration = Column(Integer)
+    distance = Column(Float)
+    fare = Column(Float)
+    service_fee = Column(Float)
+    taxes = Column(Float)
+    earnings = Column(Float)
+    payout = Column(Float)
+    trip_balance = Column(Float)
+    currency = Column(String(3), default='KES')
+    pickup_location = Column(EncryptedString)
+    dropoff_location = Column(EncryptedString)
+    is_canceled = Column(Boolean, default=False)
+    raw_data = Column(JSON)  # Store raw scraped data for debugging
+    scraped_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    def __repr__(self):
+        return f"<Trip(trip_id='{self.trip_id}', earnings={self.earnings} KES)>"
+
+class CanceledTrip(Base):
+    __tablename__ = 'canceled_trips'
+    
+    trip_id = Column(String(50), primary_key=True)
+    date = Column(DateTime)
+    trip_type = Column(String(20))
+    scraped_at = Column(DateTime, default=datetime.utcnow)
+
+class ScrapingSession(Base):
+    __tablename__ = 'scraping_sessions'
+    
+    id = Column(Integer, primary_key=True)
+    session_date = Column(DateTime, default=datetime.utcnow)
+    trips_scraped = Column(Integer, default=0)
+    canceled_trips_scraped = Column(Integer, default=0)
+    last_trip_date = Column(DateTime)
+    status = Column(String(20))
+    duration_seconds = Column(Float)
+    error_message = Column(Text)
+
+class DatabaseMetrics(Base):
+    __tablename__ = 'database_metrics'
+    
+    id = Column(Integer, primary_key=True)
+    metric_date = Column(DateTime, default=datetime.utcnow)
+    total_trips = Column(Integer)
+    total_earnings = Column(Float)
+    avg_earnings_per_trip = Column(Float)
+    success_rate = Column(Float)
+
+class DatabaseManager:
+    def __init__(self):
+        self.db_path = config.database.path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.engine = self._create_engine()
+        self.Session = sessionmaker(bind=self.engine)
+        self._create_tables()
+        self._setup_connection_events()
+    
+    def _create_engine(self):
+        """Create database engine with connection pooling"""
+        db_url = f"sqlite:///{self.db_path}"
+        return create_engine(
+            db_url, 
+            pool_pre_ping=True,
+            connect_args={'check_same_thread': False}
+        )
+    
+    def _create_tables(self):
+        """Create all tables if they don't exist"""
+        Base.metadata.create_all(self.engine)
+        logger.info("Database tables created/verified")
+    
+    def _setup_connection_events(self):
+        """Setup database connection events for monitoring"""
+        
+        @event.listens_for(self.engine, "connect")
+        def set_sqlite_pragma(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.close()
+        
+        @event.listens_for(self.engine, "checkout")
+        def checkout_listener(dbapi_connection, connection_record, connection_proxy):
+            logger.debug("Database connection checked out")
